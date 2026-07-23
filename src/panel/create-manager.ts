@@ -6,6 +6,7 @@ import { isIgnored } from '../mirror/tree-mirror';
 import { hashContent } from '../util/content-hash';
 import { isFolder as isDriveFolder } from '../drive/drive-client';
 import { guessMimeType } from '../util/mime';
+import { toNfc } from '../util/nfc';
 
 export type CreateResult = 'created' | 'skipped';
 
@@ -39,18 +40,26 @@ export class CreateManager {
     return run;
   }
 
+  /** Déplacement/renommage local (événement `rename` d'Obsidian). Sérialisé comme les créations. */
+  handleRename(oldPath: string, newPath: string, isFolder: boolean): Promise<CreateResult> {
+    const run = this.queue.then(
+      () => this.processRename(oldPath, newPath, isFolder),
+      () => this.processRename(oldPath, newPath, isFolder),
+    );
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
   /** Enfant Drive d'un dossier par nom (dédup ; évite les doublons de dossiers/fichiers). */
   private async childId(parentDriveId: string, name: string, wantFolder: boolean): Promise<string | undefined> {
     const kids = await this.opts.drive.children(parentDriveId);
     return kids.find((k) => k.name === name && isDriveFolder(k.mimeType) === wantFolder)?.id;
   }
 
-  private async process(path: string, isFolder: boolean): Promise<CreateResult> {
-    if (this.opts.wasPluginCreated?.(path)) return 'skipped';
-    if (isIgnored(path) || this.opts.index.get(path)) return 'skipped';
+  /** driveId du dossier parent de `path` (crée les dossiers intermédiaires manquants),
+   *  ou null si `path` n'est sous aucune zone synchronisée. */
+  private async resolveParentDriveId(path: string): Promise<string | null> {
     const parts = path.split('/');
-    const name = parts[parts.length - 1];
-
     const ancestors: string[] = [];
     for (let i = parts.length - 1; i > 0; i--) ancestors.push(parts.slice(0, i).join('/'));
     let baseIdx = -1;
@@ -59,8 +68,7 @@ export class CreateManager {
       const e = this.opts.index.get(ancestors[i]);
       if (e && e.isFolder && e.driveId) { baseIdx = i; parentDriveId = e.driveId; break; }
     }
-    if (baseIdx < 0) return 'skipped'; // hors zone synchronisée
-
+    if (baseIdx < 0) return null; // hors zone synchronisée
     // créer (ou réutiliser) les dossiers intermédiaires manquants, du plus haut au plus bas
     const missing = ancestors.slice(0, baseIdx).reverse();
     for (const folderPath of missing) {
@@ -70,6 +78,66 @@ export class CreateManager {
       await this.opts.index.set(folderPath, FOLDER_ENTRY(id));
       parentDriveId = id;
     }
+    return parentDriveId;
+  }
+
+  /** Cesse de suivre `path` et tout son sous-arbre (retire de l'index et de l'état).
+   *  Le fichier reste sur Drive — on ne le supprime jamais côté distant. */
+  private async untrack(path: string): Promise<void> {
+    for (const p of this.opts.index.paths()) {
+      if (p === path || p.startsWith(path + '/')) {
+        await this.opts.index.delete(p);
+        await this.opts.state.setFileSynced(p, false);
+      }
+    }
+  }
+
+  /** Déplace les clés index/état de `oldPath` (et descendants) vers `newPath`. */
+  private async reindex(oldPath: string, newPath: string): Promise<void> {
+    const affected = this.opts.index.paths().filter((p) => p === oldPath || p.startsWith(oldPath + '/'));
+    for (const p of affected) {
+      const entry = this.opts.index.get(p);
+      if (!entry) continue;
+      const np = newPath + p.slice(oldPath.length);
+      const wasSynced = this.opts.state.isSynced(p);
+      await this.opts.index.delete(p);
+      await this.opts.index.set(np, entry);
+      if (wasSynced) {
+        await this.opts.state.setFileSynced(p, false);
+        await this.opts.state.setFileSynced(np, true);
+      }
+    }
+  }
+
+  private async processRename(oldPath: string, newPath: string, isFolder: boolean): Promise<CreateResult> {
+    oldPath = toNfc(oldPath);
+    newPath = toNfc(newPath);
+    const oldEntry = this.opts.index.get(oldPath);
+    if (!oldEntry) {
+      // pas (encore) suivi → si newPath tombe sous une zone synchronisée, on le crée sur Drive
+      return this.process(newPath, isFolder);
+    }
+    // déjà suivi : déplacé/renommé
+    if (isIgnored(newPath)) { await this.untrack(oldPath); return 'skipped'; }
+    const newParent = await this.resolveParentDriveId(newPath);
+    if (newParent === null) {
+      await this.untrack(oldPath); // sorti de la zone synchronisée → on cesse de suivre
+      return 'skipped';
+    }
+    const newName = newPath.split('/').pop() as string;
+    await this.opts.drive.moveFile(oldEntry.driveId, { name: newName, addParentId: newParent });
+    await this.reindex(oldPath, newPath);
+    return 'created';
+  }
+
+  private async process(path: string, isFolder: boolean): Promise<CreateResult> {
+    if (this.opts.wasPluginCreated?.(path)) return 'skipped';
+    if (isIgnored(path) || this.opts.index.get(path)) return 'skipped';
+    const parts = path.split('/');
+    const name = parts[parts.length - 1];
+
+    const parentDriveId = await this.resolveParentDriveId(path);
+    if (parentDriveId === null) return 'skipped'; // hors zone synchronisée
 
     if (isFolder) {
       let id = await this.childId(parentDriveId, name, true);

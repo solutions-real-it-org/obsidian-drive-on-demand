@@ -203,6 +203,36 @@ describe('DriveClient.aboutUser', () => {
   });
 });
 
+describe('DriveClient.moveFile', () => {
+  it('récupère les parents actuels puis PATCH addParents/removeParents + nom', async () => {
+    const calls: { url: string; method?: string; body?: string }[] = [];
+    const http = vi.fn(async (req: { url: string; method?: string; body?: string }) => {
+      calls.push(req);
+      if (req.url.includes('fields=parents')) return res(200, { parents: ['OLD_PARENT'] });
+      return res(200, { id: 'F' });
+    }) as unknown as HttpFn;
+    await new DriveClient(http, token).moveFile('F', { name: 'nouveau.md', addParentId: 'NEW_PARENT' });
+    // 1er appel : GET parents ; 2e : PATCH move
+    expect(calls[0].url).toContain('/files/F?fields=parents');
+    const patch = calls[1];
+    expect(patch.method).toBe('PATCH');
+    expect(patch.url).toContain('addParents=NEW_PARENT');
+    expect(patch.url).toContain('removeParents=OLD_PARENT');
+    expect(patch.body).toContain('"name":"nouveau.md"');
+  });
+
+  it('ne retire pas un parent égal au nouveau (déplacement dans le même dossier = simple renommage)', async () => {
+    const calls: { url: string }[] = [];
+    const http = vi.fn(async (req: { url: string }) => {
+      calls.push(req);
+      if (req.url.includes('fields=parents')) return res(200, { parents: ['SAME'] });
+      return res(200, { id: 'F' });
+    }) as unknown as HttpFn;
+    await new DriveClient(http, token).moveFile('F', { name: 'x.md', addParentId: 'SAME' });
+    expect(calls[1].url).not.toContain('removeParents');
+  });
+});
+
 describe('DriveClient.getStartPageToken / listChanges', () => {
   it('getStartPageToken renvoie le jeton de départ', async () => {
     const http = vi.fn(async () => res(200, { startPageToken: 'TOK1' })) as unknown as HttpFn;

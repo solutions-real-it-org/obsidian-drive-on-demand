@@ -120,4 +120,55 @@ describe('CreateManager.handleCreate', () => {
     expect(createSpy).not.toHaveBeenCalled();
     expect(index.get('dir/sub')?.driveId).toBe('EXISTING_SUB');
   });
+
+  // ── Déplacement / renommage (handleRename) ──
+
+  it('déplace un fichier NON suivi dans une zone synchronisée → le crée sur Drive', async () => {
+    const index = new MirrorIndex(ad()); await index.load();
+    await index.set('dir', folderEntry('DIR_DRIVE'));
+    const state = new SelectiveSyncState(ad()); await state.load();
+    const drive = driveObj();
+    vi.spyOn(drive, 'children').mockResolvedValue([]);
+    vi.spyOn(drive, 'createFile').mockResolvedValue({ id: 'NEW', headRevisionId: 'r1' });
+    const move = vi.spyOn(drive, 'moveFile');
+    const cm = new CreateManager({ index, drive, vault: vaultObj('# hi'), state });
+    // le fichier existait ailleurs (non suivi) puis est déplacé dans dir/
+    expect(await cm.handleRename('ailleurs/note.md', 'dir/note.md', false)).toBe('created');
+    expect(drive.createFile).toHaveBeenCalledWith('DIR_DRIVE', 'note.md', '# hi');
+    expect(move).not.toHaveBeenCalled(); // pas un déplacement Drive : c'est une création
+    expect(index.get('dir/note.md')?.driveId).toBe('NEW');
+    expect(state.fileState('dir/note.md')).toBe('checked');
+  });
+
+  it('déplace un fichier DÉJÀ suivi → moveFile sur Drive + réindexe les clés', async () => {
+    const index = new MirrorIndex(ad()); await index.load();
+    await index.set('dir', folderEntry('DIR_DRIVE'));
+    await index.set('dir2', folderEntry('DIR2_DRIVE'));
+    await index.set('dir/note.md', { driveId: 'FILE', mimeType: 'text/markdown', isFolder: false, hydrated: true, pinned: true });
+    const state = new SelectiveSyncState(ad()); await state.load(); await state.setFileSynced('dir/note.md', true);
+    const drive = driveObj();
+    const move = vi.spyOn(drive, 'moveFile').mockResolvedValue(undefined);
+    const cm = new CreateManager({ index, drive, vault: vaultObj(), state });
+    expect(await cm.handleRename('dir/note.md', 'dir2/note.md', false)).toBe('created');
+    expect(move).toHaveBeenCalledWith('FILE', { name: 'note.md', addParentId: 'DIR2_DRIVE' });
+    // clés déplacées
+    expect(index.get('dir/note.md')).toBeUndefined();
+    expect(index.get('dir2/note.md')?.driveId).toBe('FILE');
+    expect(state.isSynced('dir/note.md')).toBe(false);
+    expect(state.isSynced('dir2/note.md')).toBe(true);
+  });
+
+  it('déplace un fichier suivi HORS de toute zone synchronisée → cesse de suivre (reste sur Drive)', async () => {
+    const index = new MirrorIndex(ad()); await index.load();
+    await index.set('dir', folderEntry('DIR_DRIVE'));
+    await index.set('dir/note.md', { driveId: 'FILE', mimeType: 'text/markdown', isFolder: false, hydrated: true, pinned: true });
+    const state = new SelectiveSyncState(ad()); await state.load(); await state.setFileSynced('dir/note.md', true);
+    const drive = driveObj();
+    const move = vi.spyOn(drive, 'moveFile');
+    const cm = new CreateManager({ index, drive, vault: vaultObj(), state });
+    expect(await cm.handleRename('dir/note.md', 'hors-zone/note.md', false)).toBe('skipped');
+    expect(move).not.toHaveBeenCalled();
+    expect(index.get('dir/note.md')).toBeUndefined(); // plus suivi
+    expect(state.isSynced('dir/note.md')).toBe(false);
+  });
 });

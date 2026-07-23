@@ -221,4 +221,23 @@ export class DriveClient {
     if (res.status !== 200) throw new Error(`Drive createDriveFolder ${res.status}: ${res.text}`);
     return { id: res.json<{ id: string }>().id };
   }
+
+  /** Déplace et/ou renomme un fichier/dossier Drive : le rattache à `addParentId`
+   *  (en retirant ses parents actuels) et met à jour son nom. Sur Drive, déplacer un
+   *  dossier déplace tout son contenu (les enfants gardent ce dossier pour parent). */
+  async moveFile(fileId: string, opts: { name?: string; addParentId: string }): Promise<void> {
+    const cur = await this.http({ url: `${API}/files/${fileId}?fields=parents`, headers: await this.headers() });
+    if (cur.status !== 200) throw new Error(`Drive moveFile(get parents) ${cur.status}: ${cur.text}`);
+    const parents = cur.json<{ parents?: string[] }>().parents ?? [];
+    const removeParents = parents.filter((p) => p !== opts.addParentId);
+    let url = `${API}/files/${fileId}?addParents=${encodeURIComponent(opts.addParentId)}&fields=id`;
+    if (removeParents.length) url += `&removeParents=${encodeURIComponent(removeParents.join(','))}`;
+    const res = await this.http({
+      url,
+      method: 'PATCH',
+      headers: { ...(await this.headers()), 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts.name ? { name: opts.name } : {}),
+    });
+    if (res.status !== 200) throw new Error(`Drive moveFile ${res.status}: ${res.text}`);
+  }
 }

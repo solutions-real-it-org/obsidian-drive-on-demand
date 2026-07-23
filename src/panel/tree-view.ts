@@ -153,7 +153,7 @@ export class DriveTreeView extends ItemView {
       const root = this.contentEl;
       root.empty();
       const box = root.createDiv({ cls: 'gdrive-fod-fatal' });
-      box.createEl('div', { text: '⚠ Google Drive — ' + t('panel.error', { error: '' }) });
+      box.createEl('div', { text: '⚠ Drive on Demand — ' + t('panel.error', { error: '' }) });
       const pre = box.createEl('pre');
       pre.setText(e instanceof Error ? (e.stack ?? e.message) : String(e));
     } catch (inner) {

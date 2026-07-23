@@ -1,4 +1,4 @@
-import { Plugin, Notice, TFolder, setIcon } from 'obsidian';
+import { Plugin, Notice, TFile, TFolder, type TAbstractFile, setIcon } from 'obsidian';
 import { obsidianHttp } from './http';
 import { genId } from './auth/state';
 import { buildConsentUrl } from './auth/oauth-url';
@@ -141,6 +141,12 @@ export default class GoogleDriveFodPlugin extends Plugin {
           void create.handleCreate(toNfc(file.path), file instanceof TFolder).catch((e) => new Notice(t('main.createError', { error: String(e) })));
         }),
       );
+      // Déplacement / renommage local (glisser un fichier dans un dossier synchronisé, etc.)
+      this.registerEvent(
+        this.app.vault.on('rename', (file, oldPath) => {
+          void this.handleLocalRename(create, file, oldPath).catch((e) => new Notice(t('main.createError', { error: String(e) })));
+        }),
+      );
     });
 
     this.registerView(VIEW_TYPE, (leaf) => new DriveTreeView(leaf, model, syncState, engine, this.drive, workingRoot));
@@ -273,6 +279,23 @@ export default class GoogleDriveFodPlugin extends Plugin {
         }
       }),
     );
+  }
+
+  /** Déplacement/renommage local → Drive. Un dossier déplacé DANS une zone synchronisée
+   *  ne génère qu'un seul événement `rename` (pas un par enfant) : on énumère donc ses
+   *  fichiers pour les synchroniser (no-op si déjà suivis, ex. dossier déjà synchronisé). */
+  private async handleLocalRename(create: CreateManager, file: TAbstractFile, oldPath: string): Promise<void> {
+    const isFolder = file instanceof TFolder;
+    await create.handleRename(toNfc(oldPath), toNfc(file.path), isFolder);
+    if (isFolder) {
+      const files: TFile[] = [];
+      const walk = (f: TAbstractFile): void => {
+        if (f instanceof TFolder) f.children.forEach(walk);
+        else if (f instanceof TFile) files.push(f);
+      };
+      file.children.forEach(walk);
+      for (const child of files) await create.handleCreate(toNfc(child.path), false);
+    }
   }
 
   private async activateDriveView(): Promise<void> {
