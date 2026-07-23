@@ -44,4 +44,15 @@ export class ObsidianDriveAuth {
     await this.opts.store.setRefresh(refreshToken);
     this.cached = null;
   }
+
+  /** Un compte est-il connecté (refresh token présent) ? Utilisé par l'onglet de réglages. */
+  async isConnected(): Promise<boolean> {
+    return (await this.opts.store.getRefresh()) !== null;
+  }
+
+  /** Déconnecte le compte : oublie le refresh token et le cache d'access token. */
+  async disconnect(): Promise<void> {
+    await this.opts.store.clear();
+    this.cached = null;
+  }
 }

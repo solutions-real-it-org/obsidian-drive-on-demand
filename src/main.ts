@@ -4,7 +4,6 @@ import { genId } from './auth/state';
 import { buildConsentUrl } from './auth/oauth-url';
 import { TokenStore } from './auth/token-store';
 import { ObsidianDriveAuth } from './auth/drive-auth';
-import { listRootFiles } from './drive-list';
 import { PluginDataStore, keyedAdapter } from './plugin-data';
 import { DriveClient } from './drive/drive-client';
 import { MirrorIndex } from './mirror/mirror-index';
@@ -22,6 +21,7 @@ import { SyncEngine } from './panel/sync-engine';
 import { PushManager } from './panel/push-manager';
 import { PullManager } from './panel/pull-manager';
 import { CreateManager } from './panel/create-manager';
+import { DriveOnDemandSettingTab } from './settings-tab';
 import { t } from './i18n';
 
 const BROKER = 'https://obsidian-drive.real-it.org';
@@ -37,6 +37,10 @@ export default class GoogleDriveFodPlugin extends Plugin {
   private drive!: DriveClient;
   /** Vues note ayant déjà reçu le bouton « synchroniser cette note » (évite les doublons). */
   private syncActionViews = new WeakSet<MarkdownView>();
+  /** Connexion OAuth déclenchée depuis les réglages (pas de commande). */
+  private startAuthFn!: () => void;
+  /** Sync manuelle complète déclenchée depuis les réglages (« Synchroniser maintenant »). */
+  private refreshAllFn!: () => Promise<void>;
 
   async onload(): Promise<void> {
     this.data = new PluginDataStore(
@@ -193,11 +197,6 @@ export default class GoogleDriveFodPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE, (leaf) => new DriveTreeView(leaf, model, syncState, engine, this.drive, workingRoot, create));
     this.addRibbonIcon('cloud', t('ribbon.googleDrive'), () => void this.activateDriveView());
-    this.addCommand({
-      id: 'gdrive-fod-open-panel',
-      name: t('cmd.openPanel'),
-      callback: () => void this.activateDriveView(),
-    });
 
     this.registerObsidianProtocolHandler('google-drive-fod-auth', async (params) => {
       if (params.error) {
@@ -221,81 +220,51 @@ export default class GoogleDriveFodPlugin extends Plugin {
       }
     });
 
-    this.addCommand({
-      id: 'gdrive-fod-connect',
-      name: t('cmd.connect'),
-      callback: () => {
-        this.pendingState = genId(16);
-        const url = buildConsentUrl({ clientId: CLIENT_ID, redirectUri: `${BROKER}/callback`, scope: SCOPE, state: this.pendingState });
-        window.open(url, '_blank');
-      },
-    });
+    // Connexion OAuth : déclenchée depuis l'onglet de réglages (plus de commande).
+    this.startAuthFn = () => {
+      this.pendingState = genId(16);
+      const url = buildConsentUrl({ clientId: CLIENT_ID, redirectUri: `${BROKER}/callback`, scope: SCOPE, state: this.pendingState });
+      window.open(url, '_blank');
+    };
 
-    this.addCommand({
-      id: 'gdrive-fod-list-root',
-      name: t('cmd.listRoot'),
-      callback: async () => {
+    // « Synchroniser maintenant » (réglages) : rafraîchit les fichiers synchronisés puis
+    // re-scanne les dossiers « complets » pour découvrir les nouveaux fichiers ajoutés côté
+    // Drive — sûr et idempotent (applyFolderSync ne touche jamais un fichier déjà présent).
+    this.refreshAllFn = async () => {
+      const r = await pull.refreshAllSynced();
+      const allFull = syncState.allFullFolders();
+      const topLevelFull = allFull.filter(
+        (p) => !allFull.some((other) => other !== p && p.startsWith(`${other}/`)),
+      );
+      const allFailed: string[] = [];
+      for (const folderPath of topLevelFull) {
+        const entry = this.index.get(folderPath);
+        if (!entry?.driveId) continue;
+        const folderNode: TreeNode = {
+          id: entry.driveId,
+          name: folderPath.split('/').pop() ?? folderPath,
+          path: folderPath,
+          isFolder: true,
+          meta: {
+            id: entry.driveId,
+            name: folderPath.split('/').pop() ?? folderPath,
+            mimeType: entry.mimeType,
+            modifiedTime: entry.modifiedTime ?? '',
+          },
+        };
         try {
-          const token = await this.auth.getAccessToken();
-          const files = await listRootFiles(obsidianHttp, token);
-          console.log('[gdrive-fod] racine Drive:', files);
-          new Notice(t('main.rootListed', { count: files.length }));
+          const plan = await engine.planFolderSync(folderNode);
+          const res = await engine.applyFolderSync(folderNode, plan);
+          allFailed.push(...res.failed);
         } catch (e) {
-          if (String(e).includes('NEED_INTERACTIVE_AUTH')) {
-            new Notice(t('main.notConnectedFirst'));
-          } else {
-            new Notice(t('main.genericError', { error: String(e) }));
-          }
+          console.error('[gdrive-fod] échec re-scan dossier', folderPath, e);
         }
-      },
-    });
+      }
+      if (r.conflicts > 0) new Notice(t('main.refreshSummary', { pulled: r.pulled, conflicts: r.conflicts }));
+      if (allFailed.length > 0) new Notice(t('panel.someFilesFailed', { count: allFailed.length }));
+    };
 
-    this.addCommand({
-      id: 'gdrive-fod-refresh-synced',
-      name: t('cmd.refreshSynced'),
-      callback: async () => {
-        try {
-          const r = await pull.refreshAllSynced();
-
-          // re-scanne les dossiers "complets" pour découvrir les nouveaux fichiers
-          // ajoutés côté Drive depuis la dernière synchronisation — sûr et idempotent
-          // (applyFolderSync ne touche jamais un fichier déjà présent localement).
-          const allFull = syncState.allFullFolders();
-          const topLevelFull = allFull.filter(
-            (p) => !allFull.some((other) => other !== p && p.startsWith(`${other}/`)),
-          );
-          const allFailed: string[] = [];
-          for (const folderPath of topLevelFull) {
-            const entry = this.index.get(folderPath);
-            if (!entry?.driveId) continue;
-            const folderNode: TreeNode = {
-              id: entry.driveId,
-              name: folderPath.split('/').pop() ?? folderPath,
-              path: folderPath,
-              isFolder: true,
-              meta: {
-                id: entry.driveId,
-                name: folderPath.split('/').pop() ?? folderPath,
-                mimeType: entry.mimeType,
-                modifiedTime: entry.modifiedTime ?? '',
-              },
-            };
-            try {
-              const plan = await engine.planFolderSync(folderNode);
-              const res = await engine.applyFolderSync(folderNode, plan);
-              allFailed.push(...res.failed);
-            } catch (e) {
-              console.error('[gdrive-fod] échec re-scan dossier', folderPath, e);
-            }
-          }
-
-          if (r.conflicts > 0) new Notice(t('main.refreshSummary', { pulled: r.pulled, conflicts: r.conflicts }));
-          if (allFailed.length > 0) new Notice(t('panel.someFilesFailed', { count: allFailed.length }));
-        } catch (e) {
-          new Notice(t('main.refreshError', { error: String(e) }));
-        }
-      },
-    });
+    this.addSettingTab(new DriveOnDemandSettingTab(this.app, this));
 
     const messageKeys: Record<HydrateResult, string | null> = {
       hydrated: null,
@@ -363,6 +332,38 @@ export default class GoogleDriveFodPlugin extends Plugin {
       setStatus('error');
       new Notice(t('action.syncError', { error: String(e) }));
     }
+  }
+
+  // --- API publique pour l'onglet de réglages ---
+
+  /** Un compte Google est-il connecté ? */
+  isConnected(): Promise<boolean> {
+    return this.auth.isConnected();
+  }
+
+  /** Email du compte connecté (peut échouer si hors-ligne). */
+  async accountEmail(): Promise<string | undefined> {
+    return (await this.drive.aboutUser()).email;
+  }
+
+  /** Déconnecte le compte (oublie le refresh token). */
+  disconnect(): Promise<void> {
+    return this.auth.disconnect();
+  }
+
+  /** Lance la connexion OAuth Google (ouvre le navigateur). */
+  startAuth(): void {
+    this.startAuthFn();
+  }
+
+  /** Ouvre le panneau explorateur Drive. */
+  openPanel(): Promise<void> {
+    return this.activateDriveView();
+  }
+
+  /** Synchronisation manuelle complète (« Synchroniser maintenant »). */
+  syncNow(): Promise<void> {
+    return this.refreshAllFn();
   }
 
   private async activateDriveView(): Promise<void> {
