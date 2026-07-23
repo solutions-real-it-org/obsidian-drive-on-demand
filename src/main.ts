@@ -4,6 +4,8 @@ import { genId } from './auth/state';
 import { buildConsentUrl } from './auth/oauth-url';
 import { TokenStore } from './auth/token-store';
 import { ObsidianDriveAuth } from './auth/drive-auth';
+import { ByoCredentialsStore } from './auth/byo-store';
+import { exchangeCodeForTokens, type AppCredentials } from './auth/google-oauth';
 import { PluginDataStore, keyedAdapter } from './plugin-data';
 import { DriveClient } from './drive/drive-client';
 import { MirrorIndex } from './mirror/mirror-index';
@@ -27,6 +29,9 @@ import { t } from './i18n';
 const BROKER = 'https://obsidian-drive-on-demand.solutions.real-it.org';
 const CLIENT_ID = '509417959184-8l37q9bk12kp7t5kbj8s0ar516dr8unb.apps.googleusercontent.com'; // public (pas le secret)
 const SCOPE = 'https://www.googleapis.com/auth/drive';
+/** Redirect BYO : page de rebond du broker qui renvoie le `code` brut vers obsidian://
+ *  (sans échange — le broker ne détient pas le secret de l'utilisateur). */
+const BYO_REDIRECT = `${BROKER}/callback-byo`;
 
 export default class GoogleDriveFodPlugin extends Plugin {
   private auth!: ObsidianDriveAuth;
@@ -39,6 +44,9 @@ export default class GoogleDriveFodPlugin extends Plugin {
   private syncActionViews = new WeakSet<MarkdownView>();
   /** Connexion OAuth déclenchée depuis les réglages (pas de commande). */
   private startAuthFn!: () => void;
+  /** Store + copie mémoire (accès synchrone) des identifiants BYO de l'utilisateur. */
+  private byoStore!: ByoCredentialsStore;
+  private byoConfig: AppCredentials | null = null;
   /** Sync manuelle complète déclenchée depuis les réglages (« Synchroniser maintenant »). */
   private refreshAllFn!: () => Promise<void>;
 
@@ -50,7 +58,12 @@ export default class GoogleDriveFodPlugin extends Plugin {
     await this.data.init();
 
     const tokenStore = new TokenStore(keyedAdapter(this.data, 'rt'));
-    this.auth = new ObsidianDriveAuth({ http: obsidianHttp, store: tokenStore, brokerBase: BROKER });
+    this.byoStore = new ByoCredentialsStore(keyedAdapter(this.data, 'byo'));
+    this.byoConfig = await this.byoStore.get();
+    this.auth = new ObsidianDriveAuth({
+      http: obsidianHttp, store: tokenStore, brokerBase: BROKER,
+      byoCredentials: () => this.byoConfig,
+    });
 
     this.drive = new DriveClient(obsidianHttp, () => this.auth.getAccessToken(), 'root');
     this.index = new MirrorIndex(keyedAdapter(this.data, 'mirror'));
@@ -204,12 +217,23 @@ export default class GoogleDriveFodPlugin extends Plugin {
         new Notice(t('main.authCancelled', { error: params.error }));
         return;
       }
-      if (!params.pairing || params.state !== this.pendingState) {
+      if (params.state !== this.pendingState) {
         new Notice(t('main.invalidCallback'));
         return;
       }
       this.pendingState = null;
       try {
+        // Mode BYO : le broker a rebondi le `code` brut → on l'échange DIRECTEMENT chez Google
+        // avec les identifiants de l'utilisateur (le broker n'a jamais vu son secret).
+        if (params.code && this.byoConfig) {
+          const tokens = await exchangeCodeForTokens(obsidianHttp, params.code, { ...this.byoConfig, redirectUri: BYO_REDIRECT });
+          if (!tokens.refreshToken) { new Notice(t('main.tokenFetchFailed')); return; }
+          await this.auth.setRefreshFromClaim(tokens.refreshToken);
+          setStatus('ok');
+          return;
+        }
+        // Mode managé : le broker a déjà échangé le code et stocké le refresh sous un pairing.
+        if (!params.pairing) { new Notice(t('main.invalidCallback')); return; }
         const res = await obsidianHttp({ url: `${BROKER}/claim?pairing=${encodeURIComponent(params.pairing)}` });
         if (res.status !== 200) { new Notice(t('main.tokenFetchFailed')); return; }
         const { refresh_token } = res.json<{ refresh_token: string }>();
@@ -221,9 +245,12 @@ export default class GoogleDriveFodPlugin extends Plugin {
     });
 
     // Connexion OAuth : déclenchée depuis l'onglet de réglages (plus de commande).
+    // Mode BYO → identifiants + redirect de l'utilisateur ; sinon → broker managé Real-IT.
     this.startAuthFn = () => {
       this.pendingState = genId(16);
-      const url = buildConsentUrl({ clientId: CLIENT_ID, redirectUri: `${BROKER}/callback`, scope: SCOPE, state: this.pendingState });
+      const url = this.byoConfig
+        ? buildConsentUrl({ clientId: this.byoConfig.clientId, redirectUri: BYO_REDIRECT, scope: SCOPE, state: this.pendingState })
+        : buildConsentUrl({ clientId: CLIENT_ID, redirectUri: `${BROKER}/callback`, scope: SCOPE, state: this.pendingState });
       window.open(url, '_blank');
     };
 
@@ -354,6 +381,31 @@ export default class GoogleDriveFodPlugin extends Plugin {
   /** Lance la connexion OAuth Google (ouvre le navigateur). */
   startAuth(): void {
     this.startAuthFn();
+  }
+
+  /** Identifiants BYO actuellement configurés (mode avancé), ou null (mode broker). */
+  getByoConfig(): AppCredentials | null {
+    return this.byoConfig;
+  }
+
+  /** Enregistre des identifiants BYO. Change de projet Google → on oublie l'ancienne
+   *  session (refresh token de l'ancien projet devenu invalide) : reconnexion nécessaire. */
+  async setByoConfig(creds: AppCredentials): Promise<void> {
+    await this.byoStore.set(creds);
+    this.byoConfig = await this.byoStore.get();
+    await this.auth.disconnect();
+  }
+
+  /** Repasse en mode broker managé (oublie les identifiants BYO + la session). */
+  async clearByoConfig(): Promise<void> {
+    await this.byoStore.clear();
+    this.byoConfig = null;
+    await this.auth.disconnect();
+  }
+
+  /** URI de redirection à enregistrer dans le projet Google Cloud de l'utilisateur (BYO). */
+  byoRedirectUri(): string {
+    return BYO_REDIRECT;
   }
 
   /** Ouvre le panneau explorateur Drive. */

@@ -47,6 +47,63 @@ export class DriveOnDemandSettingTab extends PluginSettingTab {
           }
         }),
       );
+
+    // --- Mode avancé : BYO credentials ---
+    this.renderByo(containerEl);
+  }
+
+  /** Section « mode avancé » : identifiants Google personnels de l'utilisateur (lève le cap 100). */
+  private renderByo(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName(t('settings.advancedHeading')).setHeading();
+
+    const current = this.plugin.getByoConfig();
+    const desc = containerEl.createEl('p', { text: t('settings.byoDesc') });
+    desc.addClass('setting-item-description');
+    containerEl.createEl('p', {
+      text: current ? t('settings.byoStatusActive', { clientId: current.clientId }) : t('settings.byoStatusManaged'),
+    }).addClass('setting-item-description');
+
+    // URI de redirection à recopier dans le projet Google Cloud de l'utilisateur.
+    new Setting(containerEl)
+      .setName(t('settings.byoRedirectLabel'))
+      .setDesc(t('settings.byoRedirectDesc'))
+      .addText((text) => {
+        text.setValue(this.plugin.byoRedirectUri());
+        text.inputEl.readOnly = true;
+        text.inputEl.style.width = '100%';
+      });
+
+    let clientId = current?.clientId ?? '';
+    let clientSecret = '';
+    new Setting(containerEl)
+      .setName(t('settings.byoClientId'))
+      .addText((text) => text.setValue(clientId).onChange((v) => { clientId = v; }));
+    new Setting(containerEl)
+      .setName(t('settings.byoClientSecret'))
+      .addText((text) => {
+        text.setPlaceholder(t('settings.byoClientSecretPlaceholder')).onChange((v) => { clientSecret = v; });
+        text.inputEl.type = 'password';
+      });
+
+    new Setting(containerEl)
+      .addButton((b) =>
+        b.setButtonText(t('settings.byoSave')).setCta().onClick(async () => {
+          if (!clientId.trim() || !clientSecret.trim()) { new Notice(t('settings.byoMissing')); return; }
+          await this.plugin.setByoConfig({ clientId: clientId.trim(), clientSecret: clientSecret.trim() });
+          new Notice(t('settings.byoSaved'));
+          this.display();
+        }),
+      )
+      .then((setting) => {
+        if (!current) return;
+        setting.addButton((b) =>
+          b.setButtonText(t('settings.byoClear')).setWarning().onClick(async () => {
+            await this.plugin.clearByoConfig();
+            new Notice(t('settings.byoCleared'));
+            this.display();
+          }),
+        );
+      });
   }
 
   /** Remplit la ligne « Compte » selon l'état de connexion (async : lit le token + l'email). */

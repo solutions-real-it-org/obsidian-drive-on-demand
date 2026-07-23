@@ -73,4 +73,25 @@ describe('ObsidianDriveAuth', () => {
     await auth.setRefreshFromClaim('1//claimed');
     expect(await store.getRefresh()).toBe('1//claimed');
   });
+
+  it('mode BYO : rafraîchit DIRECTEMENT chez Google (pas le broker) avec les identifiants de l utilisateur', async () => {
+    const store = memoryStore();
+    await store.setRefresh('1//rt');
+    const http = vi.fn(async () => jsonResponse(200, { access_token: 'BYO_AT', expires_in: 3599 })) as unknown as HttpFn;
+    const auth = new ObsidianDriveAuth({
+      http, store, brokerBase: 'https://broker',
+      byoCredentials: () => ({ clientId: 'ucid', clientSecret: 'usecret' }),
+    });
+
+    const token = await auth.getAccessToken();
+    expect(token).toBe('BYO_AT');
+    // appel Google direct, pas le broker
+    const call = (http as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(call.url).toBe('https://oauth2.googleapis.com/token');
+    expect(call.url).not.toContain('broker');
+    const params = new URLSearchParams(call.body as string);
+    expect(params.get('grant_type')).toBe('refresh_token');
+    expect(params.get('client_id')).toBe('ucid');
+    expect(params.get('client_secret')).toBe('usecret');
+  });
 });

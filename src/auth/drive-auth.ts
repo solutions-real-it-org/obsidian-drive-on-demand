@@ -1,5 +1,6 @@
 import type { HttpFn } from '../http';
 import type { TokenStore } from './token-store';
+import { refreshAccessToken, type AppCredentials } from './google-oauth';
 
 interface RefreshResponse { access_token: string; expires_in: number }
 
@@ -7,6 +8,9 @@ export interface DriveAuthOptions {
   http: HttpFn;
   store: TokenStore;
   brokerBase: string;
+  /** Mode BYO : si des identifiants Google de l'utilisateur sont configurés, le refresh
+   *  se fait DIRECTEMENT chez Google (jamais via le broker). null/absent => broker Real-IT. */
+  byoCredentials?: () => AppCredentials | null;
 }
 
 /** Fournit un access token Google valide. Le refresh (et donc le client_secret)
@@ -23,6 +27,22 @@ export class ObsidianDriveAuth {
     const refresh = await this.opts.store.getRefresh();
     if (!refresh) throw new Error('NEED_INTERACTIVE_AUTH');
 
+    const byo = this.opts.byoCredentials?.() ?? null;
+
+    // Mode BYO : appel direct à Google avec les identifiants de l'utilisateur.
+    if (byo) {
+      try {
+        const r = await refreshAccessToken(this.opts.http, refresh, byo);
+        this.cached = { value: r.accessToken, exp: Date.now() + r.expiresIn * 1000 };
+        return r.accessToken;
+      } catch {
+        await this.opts.store.clear();
+        this.cached = null;
+        throw new Error('NEED_INTERACTIVE_AUTH');
+      }
+    }
+
+    // Mode managé : le broker Real-IT détient le client_secret et fait le refresh.
     const res = await this.opts.http({
       url: `${this.opts.brokerBase}/refresh`,
       method: 'POST',
