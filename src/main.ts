@@ -1,4 +1,4 @@
-import { Plugin, Notice, TFile, TFolder, type TAbstractFile, setIcon } from 'obsidian';
+import { Plugin, Notice, TFile, TFolder, type TAbstractFile, MarkdownView, setIcon } from 'obsidian';
 import { obsidianHttp } from './http';
 import { genId } from './auth/state';
 import { buildConsentUrl } from './auth/oauth-url';
@@ -34,6 +34,8 @@ export default class GoogleDriveFodPlugin extends Plugin {
   private index!: MirrorIndex;
   private hydrator!: Hydrator;
   private drive!: DriveClient;
+  /** Vues note ayant déjà reçu le bouton « synchroniser cette note » (évite les doublons). */
+  private syncActionViews = new WeakSet<MarkdownView>();
 
   async onload(): Promise<void> {
     this.data = new PluginDataStore(
@@ -119,22 +121,44 @@ export default class GoogleDriveFodPlugin extends Plugin {
 
     const pull = new PullManager({ vault: vaultOps, drive: this.drive, index: this.index, state: syncState, onConflict: conflictNotice, onStatus: setStatus });
 
-    // Réconciliation bidirectionnelle périodique (30 s) : re-pousse le livret + tire les
-    // changements distants via l'API Changes. Pausée hors-ligne ; rattrapage au retour.
-    // NB : pas de onSyncing ici — le spinner « synchronisation » est piloté par push/pull
-    // (onStatus) uniquement pendant un vrai transfert, pas à chaque tick à vide.
+    // Synchronisation périodique CIBLÉE (5 s) : renvoie le livret (local→Drive) + rafraîchit
+    // uniquement les notes OUVERTES (Drive→local), pour qu'une note affichée reflète une
+    // édition faite ailleurs. Pausée hors-ligne ; rattrapage immédiat au retour en ligne.
+    const getOpenPaths = (): string[] => {
+      const set = new Set<string>();
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        const file = (leaf.view as { file?: { path?: string } }).file;
+        if (file?.path) set.add(toNfc(file.path));
+      });
+      return [...set];
+    };
     const scheduler = new SyncScheduler({
-      drive: this.drive, index: this.index, pull, push,
-      adapter: keyedAdapter(this.data, 'scheduler'),
+      pull, push,
+      getOpenPaths,
+      isSynced: (p) => syncState.isSynced(p),
       isOnline: () => online,
-      intervalMs: 30000,
+      intervalMs: 5000,
       onError: (e) => console.error('[gdrive-fod] tick de synchronisation', e),
     });
-    await scheduler.load();
     this.register(() => scheduler.dispose());
     // au retour en ligne : rattrapage immédiat (en plus de setOnline dans le bloc statut)
     this.registerDomEvent(window, 'online', () => void scheduler.tick());
     this.app.workspace.onLayoutReady(() => scheduler.start());
+
+    // Bouton « synchroniser cette note » dans l'en-tête de chaque note ouverte (mobile inclus).
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', (leaf) => {
+        const view = leaf?.view;
+        if (view instanceof MarkdownView && !this.syncActionViews.has(view)) {
+          this.syncActionViews.add(view);
+          view.addAction('refresh-cw', t('action.syncNote'), () => {
+            const file = view.file;
+            if (!file) return;
+            void this.syncOneNote(pull, push, syncState, toNfc(file.path), setStatus);
+          });
+        }
+      }),
+    );
 
     const create = new CreateManager({
       index: this.index, drive: this.drive, vault: vaultOps, state: syncState,
@@ -300,6 +324,31 @@ export default class GoogleDriveFodPlugin extends Plugin {
       };
       file.children.forEach(walk);
       for (const child of files) await create.handleCreate(toNfc(child.path), false);
+    }
+  }
+
+  /** Synchronise UNE note (bouton dans l'en-tête) : tire le distant (avec gestion de conflit)
+   *  puis pousse le local. Feedback via la status bar + une notification. */
+  private async syncOneNote(
+    pull: PullManager,
+    push: PushManager,
+    state: SelectiveSyncState,
+    path: string,
+    setStatus: (kind: 'busy' | 'ok' | 'error') => void,
+  ): Promise<void> {
+    if (!state.isSynced(path)) {
+      new Notice(t('action.notSynced'));
+      return;
+    }
+    setStatus('busy');
+    try {
+      await pull.refreshFile(path); // Drive → local
+      await push.flush(path); // local → Drive
+      setStatus('ok');
+      new Notice(t('action.synced'));
+    } catch (e) {
+      setStatus('error');
+      new Notice(t('action.syncError', { error: String(e) }));
     }
   }
 
