@@ -162,6 +162,16 @@ describe('DriveTreeModel', () => {
     expect(nodes.find((n) => n.name === 'sur-drive.md')?.localOnly).toBeUndefined(); // sur Drive
   });
 
+  it('NFC : un dossier sur Drive en NFD + en local en NFC n est PAS vu comme local-only (anti-doublon)', async () => {
+    const base = 'datées';
+    const { drive } = driveWith({ root: [folder('d1', base.normalize('NFD'))] });
+    const listLocal = (p: string) => (p === '' ? [{ name: base.normalize('NFC'), isFolder: true }] : []);
+    const model = new DriveTreeModel(drive, undefined, undefined, listLocal);
+    const nodes = await model.loadChildren('root', '');
+    expect(nodes.length).toBe(1); // un seul nœud, pas de doublon grisé
+    expect(nodes[0].localOnly).toBeUndefined(); // reconnu comme présent sur Drive
+  });
+
   it('un dossier local-only (id local:) se déplie depuis le LOCAL, sans appel Drive', async () => {
     const { drive, http } = driveWith({});
     const listLocal = (p: string) => (p === 'dossierlocal' ? [{ name: 'x.md', isFolder: false }] : []);

@@ -187,6 +187,20 @@ describe('CreateManager.handleCreate', () => {
     expect(state.fileState('note.md')).toBe('checked');
   });
 
+  it('NFC : uploadLocal réutilise un dossier Drive en NFD au lieu d en créer un doublon', async () => {
+    const base = 'datées';
+    const index = new MirrorIndex(ad()); await index.load();
+    await index.set('dir', folderEntry('DIR_DRIVE'));
+    const state = new SelectiveSyncState(ad()); await state.load();
+    const drive = driveObj();
+    vi.spyOn(drive, 'children').mockResolvedValue([{ id: 'EXISTING', name: base.normalize('NFD'), mimeType: 'application/vnd.google-apps.folder', modifiedTime: 't' }]);
+    const createSpy = vi.spyOn(drive, 'createDriveFolder');
+    const cm = new CreateManager({ index, drive, vault: vaultObj(), state });
+    expect(await cm.uploadLocal(`dir/${base.normalize('NFC')}`, true, 'DIR_DRIVE')).toBe('created');
+    expect(createSpy).not.toHaveBeenCalled(); // réutilise l'existant, pas de doublon
+    expect(index.get(`dir/${base}`)?.driveId).toBe('EXISTING');
+  });
+
   it('uploadLocal d un dossier téléverse récursivement son contenu local', async () => {
     const index = new MirrorIndex(ad()); await index.load();
     const state = new SelectiveSyncState(ad()); await state.load();

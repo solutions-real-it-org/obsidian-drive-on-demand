@@ -1,5 +1,6 @@
 import { DriveClient, isFolder, type DriveMeta } from '../drive/drive-client';
 import { isIgnored } from '../mirror/tree-mirror';
+import { toNfc } from '../util/nfc';
 import type { PersistAdapter } from '../auth/token-store';
 
 export interface TreeNode {
@@ -110,14 +111,17 @@ export class DriveTreeModel {
         meta: m,
       }))
       .filter((n) => !isIgnored(n.path));
-    const driveNames = new Set(driveNodes.map((n) => n.name));
+    // Comparaison NFC des deux côtés : Drive renvoie souvent du NFD (upload macOS via Drive
+    // Desktop), Obsidian du NFC → sans ça, un fichier présent des deux côtés apparaîtrait à
+    // tort « local-only » et son téléversement créerait un DOUBLON sur Drive.
+    const driveNames = new Set(driveNodes.map((n) => toNfc(n.name)));
     return this.sortNodes([...driveNodes, ...this.localOnlyNodes(parentPath, driveNames)]);
   }
 
   private localOnlyNodes(parentPath: string, exclude: Set<string>): TreeNode[] {
     if (!this.listLocal) return [];
     return this.listLocal(parentPath)
-      .filter((c) => !exclude.has(c.name))
+      .filter((c) => !exclude.has(toNfc(c.name)))
       .map((c) => {
         const path = parentPath ? `${parentPath}/${c.name}` : c.name;
         return { id: `${LOCAL_ID_PREFIX}${path}`, name: c.name, path, isFolder: c.isFolder, localOnly: true };

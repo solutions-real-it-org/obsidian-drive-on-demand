@@ -62,10 +62,13 @@ export class CreateManager {
     return run;
   }
 
-  /** Enfant Drive d'un dossier par nom (dédup ; évite les doublons de dossiers/fichiers). */
+  /** Enfant Drive d'un dossier par nom (dédup ; évite les doublons de dossiers/fichiers).
+   *  Comparaison NFC : un nom Drive en NFD (upload macOS) doit matcher le nom local NFC,
+   *  sinon on recréerait un doublon au lieu de réutiliser l'existant. */
   private async childId(parentDriveId: string, name: string, wantFolder: boolean): Promise<string | undefined> {
     const kids = await this.opts.drive.children(parentDriveId);
-    return kids.find((k) => k.name === name && isDriveFolder(k.mimeType) === wantFolder)?.id;
+    const target = toNfc(name);
+    return kids.find((k) => toNfc(k.name) === target && isDriveFolder(k.mimeType) === wantFolder)?.id;
   }
 
   /** driveId du dossier parent de `path` (crée les dossiers intermédiaires manquants),
